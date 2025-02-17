@@ -220,6 +220,7 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
             s, _ = env.reset()
             episode_count += 1
     env.close()
+    print(f"Total training time: {time.time() - start_time:.2f} seconds")
 
     # Save training data
     save_dir = "results/data_stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
