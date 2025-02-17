@@ -14,8 +14,8 @@ from streaming_drl.optim import ObGD as Optimizer
 from streaming_drl.sparse_init import sparse_init
 from streaming_drl.normalization_wrappers import NormalizeObservation, ScaleReward
 from streaming_drl.time_wrapper import AddTimeInfo
-import wandb
-
+import wandb    
+import time
 # from gym_envs import make_lift_env
 
 def initialize_weights(m):
@@ -124,24 +124,26 @@ def create_logs(env_name, seed):
 
     return log_file, eval_log_file
 
-def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, overshooting_info, eval_frequency, eval_episodes, render=False):
-    wandb.init(
-        project=f"stream-ac-{env_name}",
-        config={
-            "env_name": env_name,
-            "seed": seed,
-            "learning_rate": lr,
-            "gamma": gamma,
-            "lambda": lamda,
-            "total_steps": total_steps,
-            "entropy_coeff": entropy_coeff,
-            "kappa_policy": kappa_policy,
-            "kappa_value": kappa_value,
-            "eval_frequency": eval_frequency,
-            "eval_episodes": eval_episodes,
-        },
-        name=f"{env_name}_seed{seed}_entropy{entropy_coeff}"
-    )
+def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, wandb_log, overshooting_info, eval_frequency, eval_episodes, render=False):
+    if wandb_log:
+        wandb.init(
+            entity="apollo-lab",
+            project=f"stream-ac-test",
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "learning_rate": lr,
+                "gamma": gamma,
+                "lambda": lamda,
+                "total_steps": total_steps,
+                "entropy_coeff": entropy_coeff,
+                "kappa_policy": kappa_policy,
+                "kappa_value": kappa_value,
+                "eval_frequency": eval_frequency,
+                "eval_episodes": eval_episodes,
+            },
+            name=f"{env_name}_seed{seed}_entropy{entropy_coeff}"
+        )
 
     torch.manual_seed(seed); np.random.seed(seed)
     
@@ -165,17 +167,29 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
     s, _ = env.reset(seed=seed)
     episode_count = 0
 
+    start_time = time.time()
+    converged = False
+    
     for t in range(1, total_steps + 1):
         # Run evaluation
         if t % eval_frequency == 0:
             eval_returns, success_rate = evaluate(agent, env, eval_episodes, seed)
             mean_return = np.mean(eval_returns)
-            wandb.log({
-                "eval/mean_return": mean_return,
-                "eval/success_rate": success_rate,
-                "eval/episode": t // eval_frequency,
-                "timestep": t
-            })
+
+            if wandb_log:
+                wandb.log({
+                    "eval/mean_return": mean_return,
+                    "eval/success_rate": success_rate,
+                    "eval/episode": t // eval_frequency,
+                })
+            
+            # Check for convergence - success rate > 0.90 indicates convergence
+            if success_rate > 0.90 and not converged:
+                converged = True
+                elapsed_time = time.time() - start_time
+                with open(eval_log_file, 'a') as f:
+                    f.write(f"Model converged after {elapsed_time:.2f} seconds\n")
+            
             with open(eval_log_file, 'a') as f:
                 f.write(f"Mean Eval Episodic Return: {mean_return}, Success Rate: {success_rate}, Eval Number: {t // eval_frequency}\n")
 
@@ -189,11 +203,12 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
             if isinstance(episode_return, (list, np.ndarray)):
                 episode_return = episode_return[0]
             
-            wandb.log({
-                "train/episode_return": episode_return,
-                "train/episode": episode_count,
-                "timestep": t
-            })
+            if wandb_log:
+                wandb.log({
+                    "train/episode_return": episode_return,
+                    "train/episode": episode_count,
+                    "timestep": t
+                })
             
             if debug:
                 with open(log_file, 'a') as f:
@@ -233,8 +248,9 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
         pickle.dump((reward_stats, obs_stats), f)
 
     # Log final model to wandb
-    wandb.save(os.path.join(save_dir, f"seed_{seed}.pth"))
-    wandb.finish()
+    if wandb_log:
+        wandb.save(os.path.join(save_dir, f"seed_{seed}.pth"))
+        wandb.finish()
 
 
 def evaluate(agent, env, eval_episodes, seed):
@@ -322,18 +338,19 @@ def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_va
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream AC(λ)')
-    parser.add_argument('--env_name', type=str, default='FetchReachDense-v4')
+    parser.add_argument('--env_name', type=str, default='FetchPickAndPlaceDense-v4')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
-    parser.add_argument('--total_steps', type=int, default=1000)
+    parser.add_argument('--total_steps', type=int, default=10_000_000)
     parser.add_argument('--entropy_coeff', type=float, default=0.01)
     parser.add_argument('--kappa_policy', type=float, default=3.0)
     parser.add_argument('--kappa_value', type=float, default=2.0)
-    parser.add_argument('--eval_frequency', type=int, default=5000)
-    parser.add_argument('--eval_episodes', type=int, default=5)
+    parser.add_argument('--eval_frequency', type=int, default=10_000)
+    parser.add_argument('--eval_episodes', type=int, default=20)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--wandb_log', action='store_true', help='Enable logging to Weights & Biases')
     parser.add_argument('--overshooting_info', action='store_true')
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
@@ -342,7 +359,7 @@ if __name__ == '__main__':
     for entropy_coeff in entropy_coeffs:
         train(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, 
             entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
-            args.overshooting_info, eval_frequency=args.eval_frequency, 
+            args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
             eval_episodes=args.eval_episodes, render=args.render)
     
     # test(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.render)

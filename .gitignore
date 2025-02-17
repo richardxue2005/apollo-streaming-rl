@@ -1,0 +1,9 @@
+__pycache__/
+Gymnasium-Robotics/
+results/
+weights/
+logs/
+logs/
+robocasa_robosuite/
+streaming_drl/
+wandb/
