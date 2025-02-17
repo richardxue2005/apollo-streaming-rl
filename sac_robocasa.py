@@ -112,14 +112,14 @@ class StreamAC(nn.Module):
             if torch.sign(delta_bar * delta).item() == -1:
                 print("Overshooting Detected!")
 
-def create_logs(env_name, seed):
+def create_logs(env_name, seed, lr, gamma, lamda, entropy_coeff):
     log_dir = "logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    log_file = os.path.join(log_dir, f"{env_name}-training_log_seed_{seed}.txt")
+    log_file = os.path.join(log_dir, f"{env_name}-training_log_seed_{seed}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
     open(log_file, 'w').close()
 
-    eval_log_file = os.path.join(log_dir, f"{env_name}-eval_log_seed_{seed}.txt")
+    eval_log_file = os.path.join(log_dir, f"{env_name}-eval_log_seed_{seed}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
     open(eval_log_file, 'w').close()
 
     return log_file, eval_log_file
@@ -147,7 +147,7 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
 
     torch.manual_seed(seed); np.random.seed(seed)
     
-    log_file, eval_log_file = create_logs(env_name, seed)
+    log_file, eval_log_file = create_logs(env_name, seed, lr, gamma, lamda, entropy_coeff)
 
     # Create environments
     render_mode = "human" if render else None
@@ -346,7 +346,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
-    parser.add_argument('--total_steps', type=int, default=10_000_000)
+    parser.add_argument('--total_steps', type=int, default=50_000_000)
     parser.add_argument('--entropy_coeff', type=float, default=0.01)
     parser.add_argument('--kappa_policy', type=float, default=3.0)
     parser.add_argument('--kappa_value', type=float, default=2.0)
@@ -358,11 +358,9 @@ if __name__ == '__main__':
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
 
-    entropy_coeffs = [0.1, 0.01, 0.001, 0.0001]
-    for entropy_coeff in entropy_coeffs:
-        train(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, 
-            entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
-            args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
-            eval_episodes=args.eval_episodes, render=args.render)
+    train(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, 
+        args.entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
+        args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
+        eval_episodes=args.eval_episodes, render=args.render)
     
     # test(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.render)
