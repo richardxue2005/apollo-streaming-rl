@@ -20,7 +20,7 @@ def make_lift_env(render=False):
     env = GymWrapper(robosuite_env)
     env.spec = gym.envs.registration.EnvSpec(
         id="Lift-Panda-v0",
-        entry_point="my_project.my_envs:make_lift_env",
+        entry_point="streaming_rl.gym_envs:make_lift_env",
         max_episode_steps=1000,
         reward_threshold=200.0,
     )

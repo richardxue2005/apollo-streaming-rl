@@ -7,14 +7,16 @@ import torch
 import numpy as np
 import torch.nn as nn
 import gymnasium as gym
+import gymnasium_robotics
 import torch.nn.functional as F
 from torch.distributions import Normal
 from streaming_drl.optim import ObGD as Optimizer
 from streaming_drl.sparse_init import sparse_init
 from streaming_drl.normalization_wrappers import NormalizeObservation, ScaleReward
 from streaming_drl.time_wrapper import AddTimeInfo
+import wandb
 
-from gym_envs import make_lift_env
+# from gym_envs import make_lift_env
 
 def initialize_weights(m):
     if isinstance(m, nn.Linear):
@@ -110,18 +112,44 @@ class StreamAC(nn.Module):
             if torch.sign(delta_bar * delta).item() == -1:
                 print("Overshooting Detected!")
 
-
-def main(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, overshooting_info, render=False):
-    torch.manual_seed(seed); np.random.seed(seed)
-    
-    # Add log file setup
+def create_logs(env_name, seed):
     log_dir = "logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     log_file = os.path.join(log_dir, f"{env_name}-training_log_seed_{seed}.txt")
     open(log_file, 'w').close()
 
-    env = gym.make(env_name, render=render)
+    eval_log_file = os.path.join(log_dir, f"{env_name}-eval_log_seed_{seed}.txt")
+    open(eval_log_file, 'w').close()
+
+    return log_file, eval_log_file
+
+def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, overshooting_info, eval_frequency, eval_episodes, render=False):
+    wandb.init(
+        project=f"stream-ac-{env_name}",
+        config={
+            "env_name": env_name,
+            "seed": seed,
+            "learning_rate": lr,
+            "gamma": gamma,
+            "lambda": lamda,
+            "total_steps": total_steps,
+            "entropy_coeff": entropy_coeff,
+            "kappa_policy": kappa_policy,
+            "kappa_value": kappa_value,
+            "eval_frequency": eval_frequency,
+            "eval_episodes": eval_episodes,
+        },
+        name=f"{env_name}_seed{seed}_entropy{entropy_coeff}"
+    )
+
+    torch.manual_seed(seed); np.random.seed(seed)
+    
+    log_file, eval_log_file = create_logs(env_name, seed)
+
+    # Create environments
+    render_mode = "human" if render else None
+    env = gym.make(env_name, render_mode=render_mode, max_episode_steps=100)
     env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
@@ -132,103 +160,189 @@ def main(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_pol
     agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
     if debug:
         print("seed: {}".format(seed), "env: {}".format(env.spec.id))
+
     returns, term_time_steps = [], []
     s, _ = env.reset(seed=seed)
-    for t in range(1, total_steps+1):
+    episode_count = 0
+
+    for t in range(1, total_steps + 1):
+        # Run evaluation
+        if t % eval_frequency == 0:
+            eval_returns, success_rate = evaluate(agent, env, eval_episodes, seed)
+            mean_return = np.mean(eval_returns)
+            wandb.log({
+                "eval/mean_return": mean_return,
+                "eval/success_rate": success_rate,
+                "eval/episode": t // eval_frequency,
+                "timestep": t
+            })
+            with open(eval_log_file, 'a') as f:
+                f.write(f"Mean Eval Episodic Return: {mean_return}, Success Rate: {success_rate}, Eval Number: {t // eval_frequency}\n")
+
         a = agent.sample_action(s)
         s_prime, r, terminated, truncated, info = env.step(a)
         agent.update_params(s, a, r, s_prime,  terminated or truncated, entropy_coeff, overshooting_info)
         s = s_prime
+
         if terminated or truncated:
+            episode_return = info['episode']['r']
+            if isinstance(episode_return, (list, np.ndarray)):
+                episode_return = episode_return[0]
+            
+            wandb.log({
+                "train/episode_return": episode_return,
+                "train/episode": episode_count,
+                "timestep": t
+            })
+            
             if debug:
                 with open(log_file, 'a') as f:
-                    f.write(f"Episodic Return: {info['episode']['r'][0]}, Time Step {t}\n")
-            returns.append(info['episode']['r'][0])
+                    f.write(f"Episodic Return: {episode_return}, Time Step {t}\n")
+
+            returns.append(episode_return)
             term_time_steps.append(t)
             terminated, truncated = False, False
             s, _ = env.reset()
+            episode_count += 1
     env.close()
 
-    # Save model and env data
-    save_dir = "data_stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
+    # Save training data
+    save_dir = "results/data_stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
     os.makedirs(save_dir, exist_ok=True)  
     with open(os.path.join(save_dir, "seed_{}.pkl".format(seed)), "wb") as f:
         pickle.dump((returns, term_time_steps, env_name), f)
 
     # Save model weights
-    save_dir = "stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
+    save_dir = "weights/stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
     os.makedirs(save_dir, exist_ok=True)  
     torch.save(agent.state_dict(), os.path.join(save_dir, "seed_{}.pth".format(seed)))
+    
+    # Save env stats
+    reward_wrapper = env
+    while not isinstance(reward_wrapper, ScaleReward) and hasattr(reward_wrapper, 'env'):
+        reward_wrapper = reward_wrapper.env
         
-    reward_stats = env.reward_stats
-    obs_stats = env.obs_stats
-    os.makedirs(save_dir, exist_ok=True)  
+    obs_wrapper = env
+    while not isinstance(obs_wrapper, NormalizeObservation) and hasattr(obs_wrapper, 'env'):
+        obs_wrapper = obs_wrapper.env
+
+    reward_stats = reward_wrapper.reward_stats
+    obs_stats = obs_wrapper.obs_stats
+    os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "stats_data_{}.pkl".format(seed)), "wb") as f:
         pickle.dump((reward_stats, obs_stats), f)
 
+    # Log final model to wandb
+    wandb.save(os.path.join(save_dir, f"seed_{seed}.pth"))
+    wandb.finish()
 
-def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_value):
+
+def evaluate(agent, env, eval_episodes, seed):
     torch.manual_seed(seed)
-    env = gym.make(env_name, render=True)
+
+    returns = []
+    successes = []
+    s, _ = env.reset(seed=seed)
+    episode_count = 0
+
+    while episode_count < eval_episodes:
+        a = agent.sample_action(s)
+        s_prime, r, terminated, truncated, info = env.step(a)
+        s = s_prime
+        if terminated or truncated:
+            episode_return = info['episode']['r']
+            if isinstance(episode_return, (list, np.ndarray)):
+                episode_return = episode_return[0]
+            returns.append(episode_return)
+
+            is_success = info.get('is_success', 0)
+            if isinstance(is_success, (list, np.ndarray)):
+                is_success = is_success[0]
+            successes.append(is_success)
+
+            episode_count += 1
+            s, _ = env.reset()
+    env.close()
+
+    success_rate = np.mean(successes)
+    return returns, success_rate
+
+
+def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_value, render=True):
+    torch.manual_seed(seed)
+    render_mode = "human" if render else None
+    env = gym.make(env_name, render_mode=render_mode)
     env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
-    env = ScaleReward(env, gamma=gamma)
-    env = NormalizeObservation(env)
-    env = AddTimeInfo(env)
-
-    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
-
 
     # Load model weights
-    agent.load_state_dict(torch.load("stream_ac_Lift-Panda-v0_lr1.0_gamma0.99_lamda0.8_entropy_coeff0.01/seed_{}.pth".format(seed), weights_only=True))
-    reward_stats, obs_stats = pickle.load(open("stream_ac_Lift-Panda-v0_lr1.0_gamma0.99_lamda0.8_entropy_coeff0.01/stats_data_{}.pkl".format(seed), "rb"))
-    env.obs_stats.mean = obs_stats.mean
-    env.obs_stats.var = obs_stats.var
-    env.obs_stats.count = obs_stats.count
-    env.obs_stats.p = obs_stats.p
+    save_dir = f"stream_ac_{env_name}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
+    reward_stats, obs_stats = pickle.load(open(f"{save_dir}/stats_data_{seed}.pkl", "rb"))
+    
+    env = ScaleReward(env, gamma=gamma)
     env.reward_stats.mean = reward_stats.mean
     env.reward_stats.var = reward_stats.var
     env.reward_stats.count = reward_stats.count
     env.reward_stats.p = reward_stats.p
 
-    s, _ = env.reset()
+    env = NormalizeObservation(env)
+    env.obs_stats.mean = obs_stats.mean
+    env.obs_stats.var = obs_stats.var
+    env.obs_stats.count = obs_stats.count
+    env.obs_stats.p = obs_stats.p
 
-    returns, term_time_steps = [], []
+    env = AddTimeInfo(env)
+
+    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
+    agent.load_state_dict(torch.load(f"{save_dir}/seed_{seed}.pth", weights_only=True))
+
+    returns = []
     s, _ = env.reset(seed=seed)
-    for t in range(1, 2000+1):
-        a = np.zeros(7)
-        # a = agent.sample_action(s)
-        print(f"State: {s}")
+    episode_count = 0
+    num_episodes = 10
+    while episode_count < num_episodes:
+        a = agent.sample_action(s)
         s_prime, r, terminated, truncated, info = env.step(a)
-        agent.update_params(s, a, r, s_prime,  terminated or truncated, entropy_coeff)
+        agent.update_params(s, a, r, s_prime, terminated or truncated, entropy_coeff)
         s = s_prime
+        
         if terminated or truncated:
-            cur_return = info['episode']['r'][0]
-            print(f"Episode finished with reward: {cur_return}")
-            returns.append(cur_return)
-            term_time_steps.append(t)
-            terminated, truncated = False, False
+            episode_return = info['episode']['r']
+            if isinstance(episode_return, (list, np.ndarray)):
+                episode_return = episode_return[0]
+            print(f"Episode {episode_count + 1} finished with reward: {episode_return}")
+            returns.append(episode_return)
+            episode_count += 1
             s, _ = env.reset()
+    
     env.close()
-
-    env.close()
+    print(f"\nAverage return over {num_episodes} episodes: {np.mean(returns):.2f}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream AC(λ)')
-    parser.add_argument('--env_name', type=str, default='Lift-Panda-v0')
+    parser.add_argument('--env_name', type=str, default='FetchReachDense-v4')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=1.0)
+    parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
-    parser.add_argument('--total_steps', type=int, default=5_000_000)
+    parser.add_argument('--total_steps', type=int, default=1000)
     parser.add_argument('--entropy_coeff', type=float, default=0.01)
     parser.add_argument('--kappa_policy', type=float, default=3.0)
     parser.add_argument('--kappa_value', type=float, default=2.0)
+    parser.add_argument('--eval_frequency', type=int, default=5000)
+    parser.add_argument('--eval_episodes', type=int, default=5)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--overshooting_info', action='store_true')
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
-    main(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, args.overshooting_info, args.render)
-    # test(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value)
+
+    entropy_coeffs = [0.1, 0.01, 0.001, 0.0001]
+    for entropy_coeff in entropy_coeffs:
+        train(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, 
+            entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
+            args.overshooting_info, eval_frequency=args.eval_frequency, 
+            eval_episodes=args.eval_episodes, render=args.render)
+    
+    # test(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.render)
