@@ -26,7 +26,7 @@ def initialize_weights(m):
 class Actor(nn.Module):
     def __init__(self, n_obs=11, n_actions=3, hidden_size=128):
         super(Actor, self).__init__()
-        self.fc_layer   = nn.Linear(n_obs, hidden_size)
+        self.fc_layer = nn.Linear(n_obs, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
         self.linear_mu = nn.Linear(hidden_size, n_actions)
         self.linear_std = nn.Linear(hidden_size, n_actions)
@@ -112,19 +112,19 @@ class StreamAC(nn.Module):
             if torch.sign(delta_bar * delta).item() == -1:
                 print("Overshooting Detected!")
 
-def create_logs(env_name, seed, lr, gamma, lamda, entropy_coeff):
+def create_logs(env_name, seed, hidden_size, lr, gamma, lamda, entropy_coeff):
     log_dir = "logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    log_file = os.path.join(log_dir, f"{env_name}-training_log_seed_{seed}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
+    log_file = os.path.join(log_dir, f"{env_name}-training_log_seed_{seed}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
     open(log_file, 'w').close()
 
-    eval_log_file = os.path.join(log_dir, f"{env_name}-eval_log_seed_{seed}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
+    eval_log_file = os.path.join(log_dir, f"{env_name}-eval_log_seed_{seed}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}.txt")
     open(eval_log_file, 'w').close()
 
     return log_file, eval_log_file
 
-def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, wandb_log, overshooting_info, eval_frequency, eval_episodes, render=False):
+def train(env_name, seed, hidden_size, lr, gamma, lamda, total_steps, entropy_coeff, kappa_policy, kappa_value, debug, wandb_log, overshooting_info, eval_frequency, eval_episodes, render=False):
     if wandb_log:
         wandb.init(
             entity="apollo-lab",
@@ -132,6 +132,7 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
             config={
                 "env_name": env_name,
                 "seed": seed,
+                "hidden_size": hidden_size,
                 "learning_rate": lr,
                 "gamma": gamma,
                 "lambda": lamda,
@@ -142,12 +143,12 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
                 "eval_frequency": eval_frequency,
                 "eval_episodes": eval_episodes,
             },
-            name=f"{env_name}_seed{seed}_entropy{entropy_coeff}"
+            name=f"{env_name}_seed{seed}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy{entropy_coeff}"
         )
 
     torch.manual_seed(seed); np.random.seed(seed)
     
-    log_file, eval_log_file = create_logs(env_name, seed, lr, gamma, lamda, entropy_coeff)
+    log_file, eval_log_file = create_logs(env_name, seed, hidden_size, lr, gamma, lamda, entropy_coeff)
 
     # Create environments
     render_mode = "human" if render else None
@@ -159,7 +160,7 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
     env = NormalizeObservation(env)
     env = AddTimeInfo(env)
 
-    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
+    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], hidden_size=hidden_size, lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
     if debug:
         print("seed: {}".format(seed), "env: {}".format(env.spec.id))
 
@@ -225,13 +226,13 @@ def train(env_name, seed, lr, gamma, lamda, total_steps, entropy_coeff, kappa_po
         f.write(f"Total training time: {time.time() - start_time:.2f} seconds\n")
 
     # Save training data
-    save_dir = "results/data_stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
+    save_dir = "results/data_stream_ac_{}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}".format(env.spec.id, hidden_size, lr, gamma, lamda, entropy_coeff)
     os.makedirs(save_dir, exist_ok=True)  
     with open(os.path.join(save_dir, "seed_{}.pkl".format(seed)), "wb") as f:
         pickle.dump((returns, term_time_steps, env_name), f)
 
     # Save model weights
-    save_dir = "weights/stream_ac_{}_lr{}_gamma{}_lamda{}_entropy_coeff{}".format(env.spec.id, lr, gamma, lamda, entropy_coeff)
+    save_dir = "weights/stream_ac_{}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}".format(env.spec.id, hidden_size, lr, gamma, lamda, entropy_coeff)
     os.makedirs(save_dir, exist_ok=True)  
     torch.save(agent.state_dict(), os.path.join(save_dir, "seed_{}.pth".format(seed)))
     
@@ -287,7 +288,7 @@ def evaluate(agent, env, eval_episodes, seed):
     return returns, success_rate
 
 
-def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_value, render=True):
+def test(env_name, seed, hidden_size, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_value, render=True):
     torch.manual_seed(seed)
     render_mode = "human" if render else None
     env = gym.make(env_name, render_mode=render_mode)
@@ -296,7 +297,7 @@ def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_va
     env = gym.wrappers.ClipAction(env)
 
     # Load model weights
-    save_dir = f"stream_ac_{env_name}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
+    save_dir = f"stream_ac_{env_name}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
     reward_stats, obs_stats = pickle.load(open(f"{save_dir}/stats_data_{seed}.pkl", "rb"))
     
     env = ScaleReward(env, gamma=gamma)
@@ -313,7 +314,7 @@ def test(env_name, seed, lr, gamma, lamda, entropy_coeff, kappa_policy, kappa_va
 
     env = AddTimeInfo(env)
 
-    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
+    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], hidden_size=hidden_size, lr=lr, gamma=gamma, lamda=lamda, kappa_policy=kappa_policy, kappa_value=kappa_value)
     agent.load_state_dict(torch.load(f"{save_dir}/seed_{seed}.pth", weights_only=True))
 
     returns = []
@@ -343,6 +344,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream AC(λ)')
     parser.add_argument('--env_name', type=str, default='FetchPickAndPlaceDense-v4')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
@@ -350,7 +352,7 @@ if __name__ == '__main__':
     parser.add_argument('--entropy_coeff', type=float, default=0.01)
     parser.add_argument('--kappa_policy', type=float, default=3.0)
     parser.add_argument('--kappa_value', type=float, default=2.0)
-    parser.add_argument('--eval_frequency', type=int, default=50_000)
+    parser.add_argument('--eval_frequency', type=int, default=5_000)
     parser.add_argument('--eval_episodes', type=int, default=50)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--wandb_log', action='store_true', help='Enable logging to Weights & Biases')
@@ -358,7 +360,7 @@ if __name__ == '__main__':
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
 
-    train(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, 
+    train(args.env_name, args.seed, args.hidden_size, args.lr, args.gamma, args.lamda, args.total_steps, 
         args.entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
         args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
         eval_episodes=args.eval_episodes, render=args.render)
