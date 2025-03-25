@@ -4,7 +4,6 @@ import gymnasium_robotics
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize
 import wandb
 import argparse
 import time
@@ -232,7 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_timesteps", type=int, default=10_000_000)
     parser.add_argument("--eval_freq", type=int, default=100_000)
     parser.add_argument("--eval_episodes", type=int, default=500)
-    parser.add_argument("--wandb_log", type=bool, default=False)
+    parser.add_argument("--wandb_log", action="store_true")
     
     args = parser.parse_args()
     
