@@ -7,3 +7,4 @@ logs/
 robocasa_robosuite/
 streaming_drl/
 wandb/
+.DS_Store

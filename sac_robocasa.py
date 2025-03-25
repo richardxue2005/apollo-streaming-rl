@@ -297,7 +297,8 @@ def test(env_name, seed, hidden_size, lr, gamma, lamda, entropy_coeff, kappa_pol
     env = gym.wrappers.ClipAction(env)
 
     # Load model weights
-    save_dir = f"stream_ac_{env_name}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
+    # save_dir = f"weights/stream_ac_{env_name}_hidden_size{hidden_size}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
+    save_dir = f"weights/stream_ac_{env_name}_lr{lr}_gamma{gamma}_lamda{lamda}_entropy_coeff{entropy_coeff}"
     reward_stats, obs_stats = pickle.load(open(f"{save_dir}/stats_data_{seed}.pkl", "rb"))
     
     env = ScaleReward(env, gamma=gamma)
@@ -344,7 +345,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream AC(λ)')
     parser.add_argument('--env_name', type=str, default='FetchPickAndPlaceDense-v4')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--hidden_size', type=int, default=256)
+    parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
@@ -360,9 +361,9 @@ if __name__ == '__main__':
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
 
-    train(args.env_name, args.seed, args.hidden_size, args.lr, args.gamma, args.lamda, args.total_steps, 
-        args.entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
-        args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
-        eval_episodes=args.eval_episodes, render=args.render)
+    # train(args.env_name, args.seed, args.hidden_size, args.lr, args.gamma, args.lamda, args.total_steps, 
+    #     args.entropy_coeff, args.kappa_policy, args.kappa_value, args.debug, 
+    #     args.wandb_log, args.overshooting_info, eval_frequency=args.eval_frequency, 
+    #     eval_episodes=args.eval_episodes, render=args.render)
     
-    # test(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.render)
+    test(args.env_name, args.seed, args.hidden_size, args.lr, args.gamma, args.lamda, args.entropy_coeff, args.kappa_policy, args.kappa_value, args.render)
