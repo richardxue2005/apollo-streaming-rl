@@ -165,9 +165,20 @@ class CustomTrainCallback(BaseCallback):
         
         return True
 
-def train_model(model_type="ppo", env_name="FetchPickAndPlace-v4", total_timesteps=1_000_000, seed=0, n_envs=4, eval_freq=10000, eval_episodes=50, wandb_log=False):
+def train_model(model_type="ppo", env_name="FetchPickAndPlace-v4", total_timesteps=1_000_000, seed=0, n_envs=4, eval_freq=10000, eval_episodes=50, wandb_log=False, table_only=False):
     env = make_vec_env(env_name, n_envs=n_envs, seed=seed)
     eval_env = gym.make(env_name)
+
+    if table_only:
+        # Set target_in_the_air to False for all environments
+        for i in range(n_envs):
+            if hasattr(env.envs[i].unwrapped, 'target_in_the_air'):
+                env.envs[i].unwrapped.target_in_the_air = False
+            print(f"Set target_in_the_air=False for env {i}")
+    
+        if hasattr(eval_env.unwrapped, 'target_in_the_air'):
+            eval_env.unwrapped.target_in_the_air = False
+            print(f"Set target_in_the_air=False for eval_env")
 
     if model_type.lower() == "ppo":
         model = PPO("MultiInputPolicy", env, verbose=1,
@@ -181,6 +192,7 @@ def train_model(model_type="ppo", env_name="FetchPickAndPlace-v4", total_timeste
                     policy_kwargs=dict(net_arch=[512, 512]),
                     seed=seed)
     elif model_type.lower() == "sac":
+        # add hindsight experience replay
         model = SAC("MultiInputPolicy", env, verbose=1,
                     learning_rate=3e-4,
                     buffer_size=1_000_000,
@@ -195,6 +207,7 @@ def train_model(model_type="ppo", env_name="FetchPickAndPlace-v4", total_timeste
                     policy_kwargs=dict(net_arch=[512, 512]),
                     seed=seed)
     else:
+        # implement TQC
         raise ValueError(f"Unsupported model type: {model_type}. Choose 'ppo' or 'sac'.")
 
     eval_callback = CustomEvalCallback(model=model, model_name=model_type.lower(), eval_env=eval_env, 
@@ -225,13 +238,14 @@ def train_model(model_type="ppo", env_name="FetchPickAndPlace-v4", total_timeste
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="ppo")
-    parser.add_argument("--env", type=str, default="FetchPickAndPlaceDense-v4")
+    parser.add_argument("--env", type=str, default="FetchSlideDense-v4")
     parser.add_argument("--n_envs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total_timesteps", type=int, default=10_000_000)
+    parser.add_argument("--total_timesteps", type=int, default=5_000_000)
     parser.add_argument("--eval_freq", type=int, default=100_000)
     parser.add_argument("--eval_episodes", type=int, default=500)
     parser.add_argument("--wandb_log", action="store_true")
+    parser.add_argument("--table_only", action="store_true")
     
     args = parser.parse_args()
     
@@ -239,5 +253,5 @@ if __name__ == "__main__":
     train_model(model_type=args.model_name, env_name=args.env, n_envs=args.n_envs, 
                seed=args.seed, total_timesteps=args.total_timesteps, 
                eval_freq=args.eval_freq, eval_episodes=args.eval_episodes, 
-               wandb_log=args.wandb_log)
+               wandb_log=args.wandb_log, table_only=args.table_only)
     

@@ -20,6 +20,7 @@ def evaluate_saved_model(model_name, model_path, env_name, num_episodes=10, rend
         Average reward and success rate
     """
     env = gym.make(env_name, render_mode="human" if render else None)
+    env.unwrapped.target_in_the_air = True
     if model_name == "ppo":
         model = PPO.load(model_path)
     elif model_name == "sac":
