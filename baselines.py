@@ -12,6 +12,7 @@ import argparse
 import time
 import numpy as np
 from wandb.integration.sb3 import WandbCallback
+import moviepy.editor as mp
 
 
 class DamageCallback(BaseCallback):
@@ -502,6 +503,160 @@ class BaseModelTrainer:
         """Add environment-specific callbacks (to be implemented by subclasses)."""
         pass
     
+    def _configure_env_for_recording(self, env_instance):
+        """
+        Applies necessary wrappers to an environment instance for recording/testing.
+        Subclasses should override if specific wrappers were applied to self.eval_env 
+        and are needed for the model to function correctly.
+        """
+        # Default: no extra wrappers. 
+        # Assumes model can handle raw observations from gym.make() or that
+        # gym.make() itself provides a sufficiently wrapped environment.
+        return env_instance
+
+    def test(self, num_episodes=10, model_load_path=None, record_gif=False):
+        """
+        Tests a trained model, with an option to record a GIF of the first episode.
+        """
+        if self.eval_env is None:
+            print("Setting up environments for testing...")
+            self.setup_environments()
+
+        if model_load_path is None:
+            model_load_path = f"weights/final/{self.model_type}_{self.env_name}_seed{self.seed}.zip"
+            print(f"No --model_load_path specified, attempting to load from default: {model_load_path}")
+
+        if not os.path.exists(model_load_path):
+            print(f"Error: Model file not found at {model_load_path}. Cannot run test.")
+            return
+
+        print(f"Loading model from {model_load_path}")
+        if self.model_type == "ppo":
+            self.model = PPO.load(model_load_path, env=self.eval_env, device="auto")
+        elif self.model_type == "sac":
+            self.model = SAC.load(model_load_path, env=self.eval_env, device="auto")
+        else:
+            raise ValueError(f"Unsupported model type for loading: {self.model_type}")
+        print("Model loaded successfully.")
+
+        if self.wandb_log and wandb.run is None:
+            print("Initializing WandB for test run...")
+            test_config = {
+                "env_name": self.env_name,
+                "seed": self.seed,
+                "model_type": self.model_type,
+                "model_load_path": model_load_path,
+                "num_test_episodes": num_episodes,
+                "record_gif": record_gif,
+            }
+            if hasattr(self, 'get_wandb_config'):
+                test_config.update(self.get_wandb_config())
+
+            wandb.init(
+                entity="apollo-lab", 
+                project=f"{self.model_type}-evaluation",
+                config=test_config,
+                name=f"eval_{self.env_name}_seed{self.seed}_{os.path.basename(model_load_path)}",
+                job_type="evaluation",
+                reinit=True 
+            )
+
+        episode_rewards = []
+        episode_successes = []
+        gif_recorded_this_run = False
+
+        video_main_dir = "videos_test_gifs" 
+        sanitized_env_name = self.env_name.replace("/", "-").replace("\\", "-")
+        video_subdir_name = f"{sanitized_env_name}_{self.model_type}_seed{self.seed}"
+        video_subdir = os.path.join(video_main_dir, video_subdir_name)
+        os.makedirs(video_subdir, exist_ok=True)
+
+        for i in range(num_episodes):
+            obs, info_reset = self.eval_env.reset(seed=self.seed + i) # Use consistent seed for main eval
+            done = False
+            current_episode_reward = 0
+            ep_len = 0
+            
+            if record_gif and i == 0 and not gif_recorded_this_run:
+                print(f"Recording first test episode for GIF in {video_subdir}...")
+                
+                record_env_instance = gym.make(self.env_name, render_mode="rgb_array")
+                record_env_wrapped = self._configure_env_for_recording(record_env_instance)
+
+                temp_video_name_prefix = f"test_episode_s{self.seed}_e{i}_temp_video"
+                
+                video_recorder_env = gym.wrappers.RecordVideo(
+                    record_env_wrapped,
+                    video_folder=video_subdir,
+                    name_prefix=temp_video_name_prefix,
+                    episode_trigger=lambda ep_id: ep_id == 0,
+                    disable_logger=True
+                )
+                
+                obs_rec, _ = video_recorder_env.reset(seed=self.seed + i) # Use same seed for this episode
+                done_rec = False
+                while not done_rec:
+                    action_rec, _ = self.model.predict(obs_rec, deterministic=True)
+                    obs_rec, _, terminated_rec, truncated_rec, _ = video_recorder_env.step(action_rec)
+                    done_rec = terminated_rec or truncated_rec
+                
+                video_recorder_env.close()
+                # record_env_wrapped.close() # RecordVideo closes the wrapped env
+
+                mp4_filename = f"{temp_video_name_prefix}-episode-0.mp4"
+                mp4_path = os.path.join(video_subdir, mp4_filename)
+                
+                gif_filename = f"test_episode_s{self.seed}_{self.env_name}_{self.model_type}.gif"
+                gif_path = os.path.join(video_subdir, gif_filename)
+
+                if os.path.exists(mp4_path):
+                    try:
+                        print(f"Converting {mp4_path} to {gif_path}...")
+                        clip = mp.VideoFileClip(mp4_path)
+                        clip.write_gif(gif_path, fps=15, logger=None) # Added logger=None to suppress prog_bar
+                        clip.close()
+                        os.remove(mp4_path) 
+                        print(f"Saved test episode GIF to {gif_path}")
+                        if self.wandb_log and wandb.run is not None:
+                             wandb.log({"test/episode_gif": wandb.Video(gif_path, fps=15, format="gif")})
+                    except Exception as e:
+                        print(f"Error converting MP4 to GIF: {e}. MP4 kept at {mp4_path}")
+                else:
+                    print(f"Warning: MP4 video not found at {mp4_path}. Cannot create GIF.")
+                gif_recorded_this_run = True
+
+            # Standard evaluation loop using self.eval_env
+            info = info_reset
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info_step = self.eval_env.step(action)
+                info = info_step # Use the latest info
+                done = terminated or truncated
+                current_episode_reward += reward
+                ep_len += 1
+            
+            episode_rewards.append(current_episode_reward)
+            if 'is_success' in info:
+                episode_successes.append(float(info['is_success']))
+            
+            print(f"Test Episode {i+1}/{num_episodes}: Reward={current_episode_reward:.2f}, Length={ep_len}", end="")
+            if 'is_success' in info:
+                print(f", Success: {info['is_success']}")
+            else:
+                print()
+
+        mean_reward = np.mean(episode_rewards)
+        print(f"\nMean reward over {num_episodes} test episodes: {mean_reward:.2f}")
+        log_data = {"test/mean_reward": mean_reward, "test/num_episodes": num_episodes}
+
+        if episode_successes:
+            mean_success_rate = np.mean(episode_successes)
+            print(f"Mean success rate: {mean_success_rate:.2f}")
+            log_data["test/mean_success_rate"] = mean_success_rate
+        
+        if self.wandb_log and wandb.run is not None:
+            wandb.log(log_data)
+    
     def train(self):
         """Run the full training process."""
         # Setup components
@@ -572,7 +727,6 @@ class AntTrainer(BaseModelTrainer):
         damage_type="broken_leg",
         **kwargs
     ):
-        # Set default environment name
         kwargs.setdefault('env_name', 'Ant-v5')
         super().__init__(**kwargs)
         
@@ -582,7 +736,6 @@ class AntTrainer(BaseModelTrainer):
         self.damage_steps = damage_steps
         self.damage_type = damage_type
         
-        # Will be initialized during setup
         self.damage_callback = None
     
     def get_wandb_config(self):
@@ -605,7 +758,6 @@ class AntTrainer(BaseModelTrainer):
                 verbose=1
             )
             
-            # Apply damage wrappers to environments
             for i in range(self.n_envs):
                 self.env.envs[i] = DamageActionWrapper(self.env.envs[i], self.damage_callback)
             
@@ -615,7 +767,6 @@ class AntTrainer(BaseModelTrainer):
         if self.damage_callback is not None:
             self.callbacks.append(self.damage_callback)
             
-            # Add video recording callback
             video_callback = DamageVideoCallback(
                 damage_callback=self.damage_callback,
                 damage_start_step=self.damage_start_step,
@@ -629,6 +780,13 @@ class AntTrainer(BaseModelTrainer):
                 verbose=1
             )
             self.callbacks.append(video_callback)
+
+    def _configure_env_for_recording(self, env_instance):
+        """Applies DamageActionWrapper if damage is configured for Ant."""
+        if self.do_damage and self.damage_callback:
+            print("AntTrainer: Wrapping recording/test env with DamageActionWrapper.")
+            return DamageActionWrapper(env_instance, self.damage_callback)
+        return super()._configure_env_for_recording(env_instance)
 
 
 def create_trainer(
@@ -675,22 +833,24 @@ def train_model(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="sac")
-    parser.add_argument("--env", type=str, default="Ant-v5")
+    parser.add_argument("--env", type=str, default="FetchReachDense-v4")
     parser.add_argument("--n_envs", type=int, default=1) # set to 1 for direct comparison with stream_ac.py
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total_timesteps", type=int, default=600_000)
-    parser.add_argument("--eval_freq", type=int, default=10_000)
-    parser.add_argument("--eval_episodes", type=int, default=50)
+    parser.add_argument("--total_timesteps", type=int, default=500_000)
+    parser.add_argument("--eval_freq", type=int, default=500)
+    parser.add_argument("--eval_episodes", type=int, default=50, help="Number of episodes for evaluation callback during training")
     parser.add_argument("--wandb_log", action="store_true")
     
-    # Parse base arguments first
+    parser.add_argument("--mode", type=str, choices=["train", "test"], default="train", help="Run mode: train or test")
+    parser.add_argument("--model_load_path", type=str, default=None, help="Path to load model for testing (e.g., weights/final/model.zip)")
+    parser.add_argument("--test_episodes", type=int, default=10, help="Number of episodes to run during testing")
+    parser.add_argument("--record_gif", action="store_true", help="Record a GIF of the first test episode")
+
     base_args, remaining_args = parser.parse_known_args()
     
-    # Create environment-specific parsers
     env_specific_parser = argparse.ArgumentParser()
     
     if "Ant" in base_args.env:
-        # Add Ant-specific arguments
         env_specific_parser.add_argument("--do_damage", action="store_true", 
                                         help="Enable damage to the Ant environment")
         env_specific_parser.add_argument("--damage_start_step", type=int, default=200_000, 
@@ -701,29 +861,42 @@ if __name__ == "__main__":
                                         choices=["broken_leg", "weak_joint", "stuck_joint", "noisy_joint"],
                                         help="Type of damage to apply")
     elif "Fetch" in base_args.env:
-        # Add Fetch-specific arguments
         env_specific_parser.add_argument("--table_only", action="store_true",
                                         help="Keep target on the table for FetchPickAndPlace")
     
-    # Parse environment-specific arguments
     env_args = env_specific_parser.parse_args(remaining_args)
     
-    # Combine all arguments into a dictionary
     all_args = vars(base_args)
     all_args.update(vars(env_args))
     
-    # Extract base and environment-specific arguments
-    base_train_args = {
+    mode = all_args.pop("mode")
+    model_load_path_arg = all_args.pop("model_load_path", None)
+    test_episodes_arg = all_args.pop("test_episodes", 10)
+    record_gif_arg = all_args.pop("record_gif", False)
+
+    trainer_init_kwargs = {
         "model_type": all_args.pop("model_name"),
         "env_name": all_args.pop("env"),
-        "n_envs": all_args.pop("n_envs"),
+        "total_timesteps": all_args.pop("total_timesteps"), 
         "seed": all_args.pop("seed"),
-        "total_timesteps": all_args.pop("total_timesteps"),
-        "eval_freq": all_args.pop("eval_freq"),
-        "eval_episodes": all_args.pop("eval_episodes"),
+        "n_envs": all_args.pop("n_envs"),                  
+        "eval_freq": all_args.pop("eval_freq"),            
+        "eval_episodes": all_args.pop("eval_episodes"),    
         "wandb_log": all_args.pop("wandb_log"),
     }
+    trainer_init_kwargs.update(all_args)
+
+    trainer = create_trainer(**trainer_init_kwargs)
     
-    # Pass remaining args as environment-specific kwargs
-    train_model(**base_train_args, **all_args)
+    if mode == "train":
+        trainer.train()
+    elif mode == "test":
+        trainer.test(
+            num_episodes=test_episodes_arg,
+            model_load_path=model_load_path_arg,
+            record_gif=record_gif_arg
+        )
+        if trainer.wandb_log and wandb.run is not None:
+            print("Finishing WandB run after testing.")
+            wandb.finish()
     

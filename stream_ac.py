@@ -17,6 +17,8 @@ from streaming_drl.normalization_wrappers import NormalizeObservation, ScaleRewa
 from streaming_drl.time_wrapper import AddTimeInfo
 import wandb    
 import time
+import moviepy.editor as mp
+import glob
 # from gym_envs import make_lift_env
 
 def initialize_weights(m):
@@ -132,7 +134,8 @@ class StreamACRunner:
         wandb_log=False,
         overshooting_info=False,
         render=False,
-        max_episode_steps=100
+        max_episode_steps=100,
+        record_video=False
     ):
         self.env_name = env_name
         self.seed = seed
@@ -151,6 +154,7 @@ class StreamACRunner:
         self.overshooting_info = overshooting_info
         self.render = render
         self.max_episode_steps = max_episode_steps
+        self.record_video = record_video
         
         self.agent = None
         self.env = None
@@ -158,6 +162,8 @@ class StreamACRunner:
         self.eval_log_file = None
         self.returns = []
         self.term_time_steps = []
+
+        self.model_name = "stream_ac"
         
     def create_logs(self):
         log_dir = "logs"
@@ -365,50 +371,142 @@ class StreamACRunner:
     def test(self, num_episodes=10):
         torch.manual_seed(self.seed)
         render_mode = "human" if self.render else None
+        self.env = self.setup_environment()
+        self.agent = self.create_agent(self.env)
 
-        env = gym.make(self.env_name, render_mode=render_mode)
+        sanitized_env_name = self.env_name.replace("/", "-").replace("\\", "-")
+        video_subdir_name = sanitized_env_name + f"_{self.model_name}"
+        video_main_dir = "videos"
+        video_subdir = os.path.join(video_main_dir, video_subdir_name)
+        os.makedirs(video_subdir, exist_ok=True)
+
+        env = gym.make(self.env_name, render_mode=render_mode, max_episode_steps=self.max_episode_steps)
         env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
 
         # Load model weights
         save_dir = f"weights/stream_ac_{self.env_name}_hidden_size{self.hidden_size}_lr{self.lr}_gamma{self.gamma}_lamda{self.lamda}_entropy_coeff{self.entropy_coeff}"
-        reward_stats, obs_stats = pickle.load(open(os.path.join(save_dir, f"stats_data_{self.seed}.pkl"), "rb"))
+        
+        stats_path = os.path.join(save_dir, f"stats_data_{self.seed}.pkl")
+        if not os.path.exists(stats_path):
+            print(f"Warning: Stats file not found at {stats_path}. Normalization might not be accurate.")
+            class DummyStats: pass
+            reward_stats = DummyStats()
+            reward_stats.mean = np.array([0.0])
+            reward_stats.var = np.array([1.0])
+            reward_stats.count = 1
+            reward_stats.p = 0.99
+            
+            obs_stats = DummyStats()
+            obs_shape = self.agent.policy_net.fc_layer.in_features if self.agent else 10
+            obs_shape = self.agent.policy_net.fc_layer.in_features if self.agent else 10
+            obs_stats.mean = np.zeros(obs_shape)
+            obs_stats.var = np.ones(obs_shape)
+            obs_stats.count = 1
+            obs_stats.p = 0.99
+        else:
+            reward_stats, obs_stats = pickle.load(open(stats_path, "rb"))
         
         env = ScaleReward(env, gamma=self.gamma)
         env.reward_stats.mean = reward_stats.mean
         env.reward_stats.var = reward_stats.var
         env.reward_stats.count = reward_stats.count
-        env.reward_stats.p = reward_stats.p
+        if hasattr(reward_stats, 'p'):
+            env.reward_stats.p = reward_stats.p
 
         env = NormalizeObservation(env)
         env.obs_stats.mean = obs_stats.mean
         env.obs_stats.var = obs_stats.var
         env.obs_stats.count = obs_stats.count
-        env.obs_stats.p = obs_stats.p
+        if hasattr(obs_stats, 'p'):
+            env.obs_stats.p = obs_stats.p
 
         env = AddTimeInfo(env)
 
-        agent = StreamAC(
-            n_obs=env.observation_space.shape[0], 
-            n_actions=env.action_space.shape[0], 
-            hidden_size=self.hidden_size, 
-            lr=self.lr, 
-            gamma=self.gamma, 
-            lamda=self.lamda, 
-            kappa_policy=self.kappa_policy, 
-            kappa_value=self.kappa_value
-        )
-        agent.load_state_dict(torch.load(os.path.join(save_dir, f"seed_{self.seed}.pth")))
+        if self.agent is None:
+            self.agent = self.create_agent(env)
+            model_path = os.path.join(save_dir, f"seed_{self.seed}.pth")
+            if os.path.exists(model_path):
+                self.agent.load_state_dict(torch.load(model_path))
+            else:
+                print(f"Warning: Model weights not found at {model_path}. Agent will use initial weights.")
+        else:
+            model_path = os.path.join(save_dir, f"seed_{self.seed}.pth")
+            if os.path.exists(model_path):
+                 self.agent.load_state_dict(torch.load(model_path))
+            else:
+                print(f"Warning: Model weights not found at {model_path}. Agent will use existing weights.")
+
 
         returns = []
         s, _ = env.reset(seed=self.seed)
         episode_count = 0
-        
+        gif_recorded_this_run = False
+
         while episode_count < num_episodes:
-            a = agent.sample_action(s)
+            if self.record_video and not gif_recorded_this_run:
+                print(f"Recording first test episode for GIF in {video_subdir}...")
+                record_env = gym.make(self.env_name, render_mode="rgb_array", max_episode_steps=self.max_episode_steps)
+                record_env = gym.wrappers.FlattenObservation(record_env)
+                record_env = gym.wrappers.ClipAction(record_env)
+
+                record_env = ScaleReward(record_env, gamma=self.gamma)
+                record_env.reward_stats.mean = reward_stats.mean
+                record_env.reward_stats.var = reward_stats.var
+                record_env.reward_stats.count = reward_stats.count
+                if hasattr(reward_stats, 'p'):
+                    record_env.reward_stats.p = reward_stats.p
+
+                record_env = NormalizeObservation(record_env)
+                record_env.obs_stats.mean = obs_stats.mean
+                record_env.obs_stats.var = obs_stats.var
+                record_env.obs_stats.count = obs_stats.count
+                if hasattr(obs_stats, 'p'):
+                    record_env.obs_stats.p = obs_stats.p
+                
+                record_env = AddTimeInfo(record_env)
+
+                temp_video_name_prefix = f"test_episode_{self.seed}_temp_video"
+                video_recorder_env = RecordVideo(
+                    record_env,
+                    video_folder=video_subdir,
+                    name_prefix=temp_video_name_prefix,
+                    episode_trigger=lambda ep_id: ep_id == 0,
+                    disable_logger=True
+                )
+                
+                s_rec, _ = video_recorder_env.reset(seed=self.seed)
+                done_rec = False
+                while not done_rec:
+                    a_rec = self.agent.sample_action(s_rec)
+                    s_prime_rec, _, terminated_rec, truncated_rec, _ = video_recorder_env.step(a_rec)
+                    s_rec = s_prime_rec
+                    done_rec = terminated_rec or truncated_rec
+                
+                video_recorder_env.close()
+                record_env.close()
+
+                mp4_filename = f"{temp_video_name_prefix}-episode-0.mp4"
+                mp4_path = os.path.join(video_subdir, mp4_filename)
+                gif_filename = f"test_episode_{self.seed}.gif"
+                gif_path = os.path.join(video_subdir, gif_filename)
+
+                if os.path.exists(mp4_path):
+                    try:
+                        clip = mp.VideoFileClip(mp4_path)
+                        clip.write_gif(gif_path, fps=15)
+                        clip.close()
+                        os.remove(mp4_path) # Clean up MP4
+                        print(f"Saved test episode GIF to {gif_path}")
+                    except Exception as e:
+                        print(f"Error converting MP4 to GIF: {e}. MP4 kept at {mp4_path}")
+                else:
+                    print(f"Warning: MP4 video not found at {mp4_path}. Cannot create GIF.")
+                gif_recorded_this_run = True
+
+            a = self.agent.sample_action(s)
             s_prime, r, terminated, truncated, info = env.step(a)
-            agent.update_params(s, a, r, s_prime, terminated or truncated, self.entropy_coeff)
             s = s_prime
 
             if terminated or truncated:
@@ -425,7 +523,7 @@ class StreamACRunner:
 
 
 class AntStreamACRunner(StreamACRunner):
-    def __init__(self, do_damage, damage_start_step, damage_steps, damage_type, **kwargs):
+    def __init__(self, do_damage, damage_start_step, damage_steps, damage_type, damage_leg_sequence=None, **kwargs):
         kwargs.setdefault('env_name', 'Ant-v5')
         kwargs.setdefault('max_episode_steps', 1000)
         super().__init__(**kwargs)
@@ -433,9 +531,11 @@ class AntStreamACRunner(StreamACRunner):
         self.damage_start_step = damage_start_step
         self.damage_steps = damage_steps
         self.damage_type = damage_type
+        self.damage_leg_sequence = damage_leg_sequence
+        self.damage_sequence_index = 0
 
         self.damage_active = False
-        self.damaged_leg = 0
+        self.damaged_leg = -1
         self.damaged_joints = []
         self.leg_action_map = {
             0: [0, 4],  # Front right leg (hip, ankle)
@@ -443,17 +543,29 @@ class AntStreamACRunner(StreamACRunner):
             2: [2, 6],  # Back right leg
             3: [3, 7],  # Back left leg
         }
-    
+        
+        if self.do_damage and self.damage_leg_sequence is not None:
+            if not isinstance(self.damage_leg_sequence, list) or not all(isinstance(i, int) and 0 <= i <= 3 for i in self.damage_leg_sequence):
+                raise ValueError("damage_leg_sequence must be a list of integers between 0 and 3.")
+            if not self.damage_leg_sequence:
+                raise ValueError("damage_leg_sequence cannot be empty if provided.")
+        elif self.do_damage and self.damage_leg_sequence is None:
+             print("Warning: Damage enabled but no sequence provided. Defaulting to random leg selection.")
+
+
     def create_logs(self):
         log_dir = "logs"
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        
-        damage_info = f"_damage_{self.damage_type}" if self.do_damage else ""
-        
+
+        damage_info = ""
+        if self.do_damage:
+            sequence_info = "_sequence" if self.damage_leg_sequence else "_random"
+            damage_info = f"_damage_{self.damage_type}{sequence_info}"
+
         # Create a run name that will be used for both logs and videos
         self.run_name = f"{self.env_name}_seed{self.seed}_hidden_size{self.hidden_size}_lr{self.lr}_gamma{self.gamma}_lamda{self.lamda}_entropy{self.entropy_coeff}{damage_info}"
-        
+
         log_file = os.path.join(log_dir, f"{self.env_name}-training_log_seed_{self.seed}_hidden_size{self.hidden_size}_lr{self.lr}_gamma{self.gamma}_lamda{self.lamda}_entropy{self.entropy_coeff}{damage_info}.txt")
         open(log_file, 'w').close()
 
@@ -481,13 +593,14 @@ class AntStreamACRunner(StreamACRunner):
                     "damage_type": self.damage_type if self.do_damage else "none",
                     "damage_start_step": self.damage_start_step,
                     "damage_steps": self.damage_steps,
+                    "damage_leg_sequence": self.damage_leg_sequence if self.do_damage else None, # Log the sequence
                 },
                 name=self.run_name
             )
 
         self.log_file = log_file
         self.eval_log_file = eval_log_file
-    
+
     def apply_damage(self, a):
         """Apply damage to the action if damage is active"""
         if not self.damage_active:
@@ -545,26 +658,32 @@ class AntStreamACRunner(StreamACRunner):
     def train(self):
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
-        
+
         self.create_logs()
         self.env = self.setup_environment()
         self.agent = self.create_agent(self.env)
-        
+
         if self.debug:
             print(f"seed: {self.seed}", f"env: {self.env.spec.id}")
+            if self.do_damage and self.damage_leg_sequence:
+                print(f"Using damage sequence: {self.damage_leg_sequence}")
+            elif self.do_damage:
+                print("Using random leg damage.")
+
 
         self.returns = []
         self.term_time_steps = []
-        
+
         s, _ = self.env.reset(seed=self.seed)
         episode_count = 0
 
         self.damage_active = False
-        
+        self.damage_sequence_index = 0 # Reset sequence index at the start of training
+
         # Create videos directory with run-specific subdirectory
         videos_dir = os.path.join("videos", self.run_name)
         os.makedirs(videos_dir, exist_ok=True)
-        
+
         for t in range(1, self.total_steps + 1):
             # Run evaluation
             if t % self.eval_frequency == 0:
@@ -575,42 +694,51 @@ class AntStreamACRunner(StreamACRunner):
                     wandb.log({
                         "eval/mean_return": mean_return,
                         "eval/episode": t // self.eval_frequency,
+                        "timestep": t # Log timestep for eval as well
                     })
-                
+
                 with open(self.eval_log_file, 'a') as f:
                     f.write(f"Mean Eval Episodic Return: {mean_return}, Eval Number: {t // self.eval_frequency}\n")
 
-            # Record video before applying damage
-            if self.do_damage and t >= self.damage_start_step - 1:
-                # Record pre-damage behavior one step before damage
-                if (t + 1) % self.damage_steps == 0 and t + 1 >= self.damage_start_step:
-                    # Record pre-damage behavior
-                    video_path = os.path.join(videos_dir, f"{self.env_name}_step{t}_pre_damage.mp4")
-                    self.record_video(video_path)
+            # Record video before applying damage and apply damage logic
+            if self.do_damage and t >= self.damage_start_step:
+                # Check if it's time for a damage event
+                if t % self.damage_steps == 0:
+                    # Record pre-damage behavior just before applying new damage
+                    video_path_pre = os.path.join(videos_dir, f"{self.env_name}_step{t}_pre_damage.mp4")
+                    self.record_video(video_path_pre)
                     if self.debug:
-                        print(f"Recorded pre-damage behavior at step {t} to {video_path}")
-                
-                # Apply damage at the exact step
-                if t % self.damage_steps == 0 and t >= self.damage_start_step:
+                        print(f"Recorded pre-damage behavior at step {t} to {video_path_pre}")
+
                     self.damage_active = True
-                    self.damaged_leg = np.random.randint(0, 4)
+                    if self.damage_leg_sequence:
+                        # Use the sequence, cycling if necessary
+                        seq_len = len(self.damage_leg_sequence)
+                        current_leg_index_in_seq = self.damage_sequence_index % seq_len
+                        self.damaged_leg = self.damage_leg_sequence[current_leg_index_in_seq]
+                        self.damage_sequence_index += 1 # Move to the next index for the next damage event
+                    else:
+                        # Fallback to random selection if no sequence provided
+                        self.damaged_leg = np.random.randint(0, 4)
+
                     self.damaged_joints = self.leg_action_map[self.damaged_leg]
+
                     if self.wandb_log:
                         wandb.log({"damage_introduced": self.damage_type, "damaged_leg": self.damaged_leg, "timestep": t})
                     if self.debug:
                         print(f"Introducing {self.damage_type} to leg {self.damaged_leg} at step {t}")
-                    
-                    # Record post-damage behavior
-                    video_path = os.path.join(videos_dir, f"{self.env_name}_step{t}_post_damage_{self.damage_type}_leg{self.damaged_leg}.mp4")
-                    self.record_video(video_path)
+
+                    # Record post-damage behavior immediately after applying new damage
+                    video_path_post = os.path.join(videos_dir, f"{self.env_name}_step{t}_post_damage_{self.damage_type}_leg{self.damaged_leg}.mp4")
+                    self.record_video(video_path_post)
                     if self.debug:
-                        print(f"Recorded post-damage behavior at step {t} to {video_path}")
-            
+                        print(f"Recorded post-damage behavior at step {t} to {video_path_post}")
+
             a = self.agent.sample_action(s)
-            
+
             if self.damage_active:
-                a = self.apply_damage(a)
-                
+                a = self.apply_damage(a) # Apply damage based on self.damaged_leg and self.damage_type
+
             s_prime, r, terminated, truncated, info = self.env.step(a)
             self.agent.update_params(s, a, r, s_prime, terminated or truncated, self.entropy_coeff, self.overshooting_info)
             s = s_prime
@@ -619,14 +747,14 @@ class AntStreamACRunner(StreamACRunner):
                 episode_return = info['episode']['r']
                 if isinstance(episode_return, (list, np.ndarray)):
                     episode_return = episode_return[0]
-                
+
                 if self.wandb_log:
                     wandb.log({
                         "train/episode_return": episode_return,
                         "train/episode": episode_count,
                         "timestep": t
                     })
-                
+
                 if self.debug:
                     with open(self.log_file, 'a') as f:
                         f.write(f"Episodic Return: {episode_return}, Time Step {t}\n")
@@ -636,7 +764,7 @@ class AntStreamACRunner(StreamACRunner):
                 terminated, truncated = False, False
                 s, _ = self.env.reset()
                 episode_count += 1
-        
+
         self.env.close()
 
         # Save model, stats and data
@@ -677,13 +805,13 @@ class AntStreamACRunner(StreamACRunner):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream AC(λ)')
-    parser.add_argument('--env_name', type=str, default='Ant-v5')
+    parser.add_argument('--env_name', type=str, default='FetchReachDense-v4')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
-    parser.add_argument('--total_steps', type=int, default=600_000)
+    parser.add_argument('--total_steps', type=int, default=1_600_000)
     parser.add_argument('--entropy_coeff', type=float, default=0.01)
     parser.add_argument('--kappa_policy', type=float, default=3.0)
     parser.add_argument('--kappa_value', type=float, default=2.0)
@@ -694,16 +822,18 @@ if __name__ == '__main__':
     parser.add_argument('--overshooting_info', action='store_true')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--mode', type=str, choices=['train', 'test'], default='train')
+    parser.add_argument('--record_video', action='store_true', help='Enable video recording during testing')
     # Add Ant-specific arguments
     parser.add_argument('--do_damage', action='store_true')
-    parser.add_argument('--damage_start_step', type=int, default=200_000)
+    parser.add_argument('--damage_start_step', type=int, default=500_000)
     parser.add_argument('--damage_steps', type=int, default=100_000, help='Steps between damage events (Ant-v5 only)')
-    parser.add_argument('--damage_type', type=str, default='broken_leg', 
+    parser.add_argument('--damage_type', type=str, default='broken_leg',
                         choices=['broken_leg', 'weak_joint', 'stuck_joint', 'noisy_joint'],
                         help='Type of damage to apply (Ant-v5 only)')
     args = parser.parse_args()
 
-    # Create runner based on environment
+    DAMAGE_LEG_SEQUENCE = [2, 1, 2, 2, 3, 2, 0, 0, 2, 0, 3]
+
     if args.env_name == 'Ant-v5':
         runner = AntStreamACRunner(
             seed=args.seed,
@@ -721,11 +851,13 @@ if __name__ == '__main__':
             wandb_log=args.wandb_log,
             overshooting_info=args.overshooting_info,
             render=args.render,
+            record_video=args.record_video,
             # Pass Ant-specific arguments
             do_damage=args.do_damage,
             damage_start_step=args.damage_start_step,
             damage_steps=args.damage_steps,
-            damage_type=args.damage_type
+            damage_type=args.damage_type,
+            damage_leg_sequence=DAMAGE_LEG_SEQUENCE
         )
     else:
         runner = StreamACRunner(
@@ -744,7 +876,8 @@ if __name__ == '__main__':
             debug=args.debug,
             wandb_log=args.wandb_log,
             overshooting_info=args.overshooting_info,
-            render=args.render
+            render=args.render,
+            record_video=args.record_video
         )
     
     if args.mode == 'train':
